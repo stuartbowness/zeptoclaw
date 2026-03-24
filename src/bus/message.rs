@@ -39,10 +39,13 @@ pub struct OutboundMessage {
     /// Additional metadata key-value pairs for channel-specific delivery hints
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+    /// Media attachments (images, documents, etc.) to send alongside text
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<MediaAttachment>,
 }
 
 /// Represents a media attachment (image, audio, video, or document)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaAttachment {
     /// The type of media
     pub media_type: MediaType,
@@ -162,7 +165,14 @@ impl OutboundMessage {
             content: content.to_string(),
             reply_to: None,
             metadata: HashMap::new(),
+            media: Vec::new(),
         }
+    }
+
+    /// Attaches a media item to the outbound message.
+    pub fn with_media(mut self, attachment: MediaAttachment) -> Self {
+        self.media.push(attachment);
+        self
     }
 
     /// Sets the message ID to reply to (builder pattern).

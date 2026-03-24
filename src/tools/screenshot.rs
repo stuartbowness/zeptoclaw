@@ -467,7 +467,7 @@ impl Tool for WebScreenshotTool {
             .to_string()
         } else {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&screenshot_result);
-            json!({
+            let result_json = json!({
                 "url": url_str,
                 "format": "png",
                 "encoding": "base64",
@@ -476,7 +476,15 @@ impl Tool for WebScreenshotTool {
                 "height": height,
                 "data": encoded,
             })
-            .to_string()
+            .to_string();
+
+            let media =
+                crate::bus::message::MediaAttachment::new(crate::bus::message::MediaType::Image)
+                    .with_data(screenshot_result)
+                    .with_filename("screenshot.png")
+                    .with_mime_type("image/png");
+
+            return Ok(ToolOutput::llm_only(result_json).with_media(media));
         };
 
         Ok(ToolOutput::llm_only(result))

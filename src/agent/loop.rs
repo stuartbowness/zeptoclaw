@@ -1437,19 +1437,27 @@ impl AgentLoop {
                         let pause = tool_output.as_ref().is_some_and(|o| o.pause_for_input);
                         let elapsed = tool_start.elapsed();
                         let latency_ms = elapsed.as_millis() as u64;
-                        // Send to user if tool opted in
+                        // Send to user if tool opted in or produced media
                         if let Some(ref output) = tool_output {
-                            if let Some(ref user_msg) = output.for_user {
+                            let has_media = !output.media.is_empty();
+                            if output.for_user.is_some() || has_media {
                                 let mut outbound = crate::bus::OutboundMessage::new(
                                     ctx.channel.as_deref().unwrap_or(""),
                                     ctx.chat_id.as_deref().unwrap_or(""),
-                                    user_msg,
+                                    output.for_user.as_deref().unwrap_or(""),
                                 );
-                                // Propagate routing metadata (e.g. telegram_thread_id)
                                 if let Some(tid) = inbound_meta.get("telegram_thread_id") {
                                     outbound
                                         .metadata
                                         .insert("telegram_thread_id".to_string(), tid.clone());
+                                }
+                                if let Some(mid) = inbound_meta.get("telegram_message_id") {
+                                    outbound
+                                        .metadata
+                                        .insert("telegram_message_id".to_string(), mid.clone());
+                                }
+                                for attachment in &output.media {
+                                    outbound.media.push(attachment.clone());
                                 }
                                 let _ = bus_for_tools.publish_outbound(outbound).await;
                             }
@@ -2095,18 +2103,26 @@ impl AgentLoop {
                         let elapsed = tool_start.elapsed();
                         let latency_ms = elapsed.as_millis() as u64;
                         if let Some(output) = tool_output {
-                            // Send to user if tool opted in
-                            if let Some(ref user_msg) = output.for_user {
+                            // Send to user if tool opted in or produced media
+                            let has_media = !output.media.is_empty();
+                            if output.for_user.is_some() || has_media {
                                 let mut outbound = crate::bus::OutboundMessage::new(
                                     ctx.channel.as_deref().unwrap_or(""),
                                     ctx.chat_id.as_deref().unwrap_or(""),
-                                    user_msg,
+                                    output.for_user.as_deref().unwrap_or(""),
                                 );
-                                // Propagate routing metadata (e.g. telegram_thread_id)
                                 if let Some(tid) = inbound_meta.get("telegram_thread_id") {
                                     outbound
                                         .metadata
                                         .insert("telegram_thread_id".to_string(), tid.clone());
+                                }
+                                if let Some(mid) = inbound_meta.get("telegram_message_id") {
+                                    outbound
+                                        .metadata
+                                        .insert("telegram_message_id".to_string(), mid.clone());
+                                }
+                                for attachment in &output.media {
+                                    outbound.media.push(attachment.clone());
                                 }
                                 let _ = bus_for_tools.publish_outbound(outbound).await;
                             }

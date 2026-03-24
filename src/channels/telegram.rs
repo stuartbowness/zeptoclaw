@@ -1186,7 +1186,9 @@ impl Channel for TelegramChannel {
     /// - The Telegram API request fails
     async fn send(&self, msg: OutboundMessage) -> Result<()> {
         use teloxide::prelude::*;
-        use teloxide::types::{ChatId, MessageId, ParseMode, ReactionType, ReplyParameters};
+        use teloxide::types::{
+            ChatId, InputFile, MessageId, ParseMode, ReactionType, ReplyParameters,
+        };
 
         if !self.running.load(Ordering::SeqCst) {
             warn!("Telegram channel not running, cannot send message");
@@ -1229,6 +1231,66 @@ impl Channel for TelegramChannel {
                     }])
                     .await;
             }
+        }
+
+        // Send media attachments (photos, documents) before text.
+        for attachment in &msg.media {
+            match attachment.media_type {
+                MediaType::Image => {
+                    if let Some(ref data) = attachment.data {
+                        let filename = attachment.filename.as_deref().unwrap_or("image.png");
+                        let input_file =
+                            InputFile::memory(data.clone()).file_name(filename.to_string());
+                        let mut req = bot.send_photo(ChatId(chat_id), input_file);
+                        if let Some(thread_id_str) = msg.metadata.get("telegram_thread_id") {
+                            if let Ok(tid) = thread_id_str.parse::<i32>() {
+                                req = req.message_thread_id(teloxide::types::ThreadId(
+                                    teloxide::types::MessageId(tid),
+                                ));
+                            }
+                        }
+                        let reply_id = msg
+                            .reply_to
+                            .as_deref()
+                            .or(msg.metadata.get("telegram_message_id").map(|s| s.as_str()));
+                        if let Some(id_str) = reply_id {
+                            if let Ok(id) = id_str.parse::<i32>() {
+                                req = req.reply_parameters(
+                                    ReplyParameters::new(MessageId(id))
+                                        .allow_sending_without_reply(),
+                                );
+                            }
+                        }
+                        req.await.map_err(|e| {
+                            ZeptoError::Channel(format!("Failed to send Telegram photo: {}", e))
+                        })?;
+                    }
+                }
+                _ => {
+                    if let Some(ref data) = attachment.data {
+                        let filename = attachment.filename.as_deref().unwrap_or("file");
+                        let input_file =
+                            InputFile::memory(data.clone()).file_name(filename.to_string());
+                        let mut req = bot.send_document(ChatId(chat_id), input_file);
+                        if let Some(thread_id_str) = msg.metadata.get("telegram_thread_id") {
+                            if let Ok(tid) = thread_id_str.parse::<i32>() {
+                                req = req.message_thread_id(teloxide::types::ThreadId(
+                                    teloxide::types::MessageId(tid),
+                                ));
+                            }
+                        }
+                        req.await.map_err(|e| {
+                            ZeptoError::Channel(format!("Failed to send Telegram document: {}", e))
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Skip text send if content is empty and we already sent media.
+        if msg.content.is_empty() && !msg.media.is_empty() {
+            info!("Telegram: Media sent successfully to chat {}", chat_id);
+            return Ok(());
         }
 
         let rendered = render_telegram_html(&msg.content);

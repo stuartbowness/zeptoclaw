@@ -89,6 +89,9 @@ pub struct ToolOutput {
     /// When true, the agent loop should break after this tool result
     /// and wait for the next user message before continuing.
     pub pause_for_input: bool,
+    /// Media attachments to send to the user (images, documents, etc.).
+    /// Delivered immediately via the outbound message bus.
+    pub media: Vec<crate::bus::message::MediaAttachment>,
 }
 
 impl ToolOutput {
@@ -100,6 +103,7 @@ impl ToolOutput {
             is_error: false,
             is_async: false,
             pause_for_input: false,
+            media: Vec::new(),
         }
     }
 
@@ -112,6 +116,7 @@ impl ToolOutput {
             is_error: false,
             is_async: false,
             pause_for_input: false,
+            media: Vec::new(),
         }
     }
 
@@ -123,6 +128,7 @@ impl ToolOutput {
             is_error: true,
             is_async: false,
             pause_for_input: false,
+            media: Vec::new(),
         }
     }
 
@@ -134,6 +140,7 @@ impl ToolOutput {
             is_error: false,
             is_async: true,
             pause_for_input: false,
+            media: Vec::new(),
         }
     }
 
@@ -149,6 +156,7 @@ impl ToolOutput {
             is_error: false,
             is_async: false,
             pause_for_input: false,
+            media: Vec::new(),
         }
     }
 
@@ -158,6 +166,12 @@ impl ToolOutput {
     /// this result and wait for the next user message.
     pub fn with_pause(mut self) -> Self {
         self.pause_for_input = true;
+        self
+    }
+
+    /// Attach a media item to be sent to the user immediately.
+    pub fn with_media(mut self, attachment: crate::bus::message::MediaAttachment) -> Self {
+        self.media.push(attachment);
         self
     }
 }
