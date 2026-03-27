@@ -136,7 +136,7 @@ impl BrowserTool {
             .await?;
         let final_url = final_url.trim();
 
-        if final_url.is_empty() {
+        if final_url.is_empty() || final_url == "about:blank" {
             return Ok(());
         }
 
@@ -322,7 +322,7 @@ impl Tool for BrowserTool {
         } else {
             match command {
                 // <selector> <text> — split into exactly two args
-                "fill" | "type" => match args_str.split_once(char::is_whitespace) {
+                "fill" | "type" | "find" => match args_str.split_once(char::is_whitespace) {
                     Some((sel, text)) => vec![sel, text.trim_start()],
                     None => vec![args_str],
                 },
