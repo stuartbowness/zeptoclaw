@@ -227,13 +227,16 @@ pub fn shrink_tool_results(
 
 /// Progressively shrink tool results with decreasing budgets for older messages.
 ///
-/// Newer tool results (last `recent_count`) keep their full budget.
-/// Older tool results get 1/4 of the budget for more aggressive truncation.
+/// Three tiers based on distance from the most recent tool result:
+/// - **Recent** (last `recent_count`): keep full `target_max_bytes` budget
+/// - **Mid-age** (between `recent_count` and `stale_threshold`): 1/4 budget
+/// - **Stale** (beyond `stale_threshold`): collapse to a one-liner
 ///
 /// # Arguments
 /// * `messages` - The conversation messages to process
 /// * `target_max_bytes` - Maximum byte length for recent tool results
 /// * `recent_count` - How many recent tool results keep the full budget
+/// * `stale_threshold` - Distance from end beyond which results collapse to a one-liner
 ///
 /// # Returns
 /// The modified messages with progressively shrunk tool results.
@@ -247,7 +250,7 @@ pub fn shrink_tool_results(
 ///     Message::tool_result("call_1", "old result that is quite long"),
 ///     Message::tool_result("call_2", "new result that is quite long"),
 /// ];
-/// let result = shrink_tool_results_progressive(msgs, 20, 1);
+/// let result = shrink_tool_results_progressive(msgs, 20, 1, 100);
 /// // Old result gets 1/4 budget, new result gets full budget
 /// assert!(result[0].content.len() < result[1].content.len() || result[1].content.len() <= 20);
 /// ```
@@ -255,6 +258,7 @@ pub fn shrink_tool_results_progressive(
     messages: Vec<Message>,
     target_max_bytes: usize,
     recent_count: usize,
+    stale_threshold: usize,
 ) -> Vec<Message> {
     // Collect indices of tool result messages
     let tool_result_indices: Vec<usize> = messages
@@ -269,33 +273,56 @@ pub fn shrink_tool_results_progressive(
         return messages;
     }
 
+    // Build tool_call_id -> tool_name lookup from assistant messages
+    let tool_name_map: std::collections::HashMap<String, String> = messages
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flat_map(|calls| calls.iter())
+        .map(|tc| (tc.id.clone(), tc.name.clone()))
+        .collect();
+
     let mut messages = messages;
     for (pos, &idx) in tool_result_indices.iter().enumerate() {
-        let is_recent = pos >= total_tool_results.saturating_sub(recent_count);
-        let budget = if is_recent {
-            target_max_bytes
-        } else {
-            // Older results get 1/4 the budget
-            target_max_bytes / 4
-        };
+        let distance_from_end = total_tool_results - 1 - pos;
+        let is_recent = distance_from_end < recent_count;
+        let is_stale = distance_from_end >= stale_threshold;
 
-        let msg = &mut messages[idx];
-        if msg.content.len() > budget {
-            let original_len = msg.content.len();
-            msg.content.truncate(budget);
-            while !msg.content.is_char_boundary(msg.content.len()) {
-                msg.content.pop();
-            }
-            msg.content.push_str(&format!(
-                "\n...[shrunk from {} to {} bytes]",
-                original_len,
-                msg.content.len()
-            ));
-            // Keep content_parts in sync so token estimation uses the shrunk size
-            if !msg.content_parts.is_empty() {
-                msg.content_parts = vec![ContentPart::Text {
-                    text: msg.content.clone(),
-                }];
+        if is_stale {
+            // Stale tier: collapse to one-liner
+            let msg = &mut messages[idx];
+            let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("");
+            let one_liner = match tool_name_map.get(tool_call_id as &str) {
+                Some(name) => format!("[{}: result consumed]", name),
+                None => "[tool result consumed]".to_string(),
+            };
+            msg.content = one_liner.clone();
+            msg.content_parts = vec![ContentPart::Text { text: one_liner }];
+        } else {
+            let budget = if is_recent {
+                target_max_bytes
+            } else {
+                // Mid-age results get 1/4 the budget
+                target_max_bytes / 4
+            };
+
+            let msg = &mut messages[idx];
+            if msg.content.len() > budget {
+                let original_len = msg.content.len();
+                msg.content.truncate(budget);
+                while !msg.content.is_char_boundary(msg.content.len()) {
+                    msg.content.pop();
+                }
+                msg.content.push_str(&format!(
+                    "\n...[shrunk from {} to {} bytes]",
+                    original_len,
+                    msg.content.len()
+                ));
+                // Keep content_parts in sync so token estimation uses the shrunk size
+                if !msg.content_parts.is_empty() {
+                    msg.content_parts = vec![ContentPart::Text {
+                        text: msg.content.clone(),
+                    }];
+                }
             }
         }
     }
@@ -380,7 +407,7 @@ pub fn try_recover_context_with_urgency(
             }
 
             let emergency_budget = (tool_result_budget / 2).max(1).min(tool_result_budget);
-            let recovered = shrink_tool_results_progressive(recovered, emergency_budget, 2);
+            let recovered = shrink_tool_results_progressive(recovered, emergency_budget, 2, 10);
             let estimated = ContextMonitor::estimate_tokens_with_margin(&recovered, safety_margin);
             if (estimated as f64) <= target {
                 return (recovered, 2);
@@ -396,7 +423,7 @@ pub fn try_recover_context_with_urgency(
             }
 
             // Tier 2: Shrink tool results progressively
-            let recovered = shrink_tool_results_progressive(recovered, tool_result_budget, 3);
+            let recovered = shrink_tool_results_progressive(recovered, tool_result_budget, 3, 15);
             let estimated = ContextMonitor::estimate_tokens_with_margin(&recovered, safety_margin);
             if (estimated as f64) <= target {
                 return (recovered, 2);
@@ -463,7 +490,7 @@ pub fn strip_images_from_messages(messages: &mut [Message]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ContentPart, ImageSource};
+    use crate::session::{ContentPart, ImageSource, ToolCall};
 
     // ── strip_images_from_messages ────────────────────────────────────
 
@@ -736,7 +763,7 @@ mod tests {
             Message::tool_result("call_2", &long_content), // old — gets 1/4 budget
             Message::tool_result("call_3", &long_content), // recent — gets full budget
         ];
-        let result = shrink_tool_results_progressive(msgs, 200, 1);
+        let result = shrink_tool_results_progressive(msgs, 200, 1, 100);
 
         // Old results (call_1, call_2) should be shrunk to ~50 bytes (200/4)
         // Recent result (call_3) should be shrunk to ~200 bytes
@@ -797,7 +824,7 @@ mod tests {
         // Verify content_parts are populated
         assert!(!msgs[0].content_parts.is_empty());
 
-        let result = shrink_tool_results_progressive(msgs, 100, 1);
+        let result = shrink_tool_results_progressive(msgs, 100, 1, 100);
         // Both should have been shrunk and content_parts synced
         for msg in &result {
             assert_eq!(msg.content_parts.len(), 1);
@@ -821,6 +848,128 @@ mod tests {
             result[0].content_parts.is_empty(),
             "Empty content_parts should remain empty"
         );
+    }
+
+    // ── stale tier ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_stale_results_collapse_with_tool_name() {
+        let long_content = "x".repeat(500);
+        let mut assistant_msg = Message::assistant("Calling web_fetch");
+        assistant_msg.tool_calls = Some(vec![ToolCall::new(
+            "call_1",
+            "web_fetch",
+            r#"{"url": "https://example.com"}"#,
+        )]);
+        let msgs = vec![
+            assistant_msg,
+            Message::tool_result("call_1", &long_content), // stale (distance=3)
+            Message::tool_result("call_2", &long_content), // mid-age (distance=2)
+            Message::tool_result("call_3", &long_content), // mid-age (distance=1)
+            Message::tool_result("call_4", &long_content), // recent (distance=0)
+        ];
+        // recent_count=1, stale_threshold=3 → call_1 is stale
+        let result = shrink_tool_results_progressive(msgs, 200, 1, 3);
+
+        assert_eq!(result[1].content, "[web_fetch: result consumed]");
+        assert_eq!(
+            result[1].content_parts,
+            vec![ContentPart::Text {
+                text: "[web_fetch: result consumed]".to_string()
+            }]
+        );
+        // Mid-age and recent should be shrunk, not collapsed
+        assert!(result[2].content.contains("...[shrunk from"));
+        assert!(result[4].content.contains("...[shrunk from"));
+    }
+
+    #[test]
+    fn test_stale_result_without_matching_assistant_falls_back() {
+        let long_content = "x".repeat(500);
+        let msgs = vec![
+            Message::tool_result("orphan_call", &long_content), // stale, no matching assistant
+            Message::tool_result("call_2", &long_content),      // recent
+        ];
+        let result = shrink_tool_results_progressive(msgs, 200, 1, 1);
+
+        assert_eq!(result[0].content, "[tool result consumed]");
+        assert_eq!(
+            result[0].content_parts,
+            vec![ContentPart::Text {
+                text: "[tool result consumed]".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_three_tiers_applied_correctly() {
+        let long_content = "x".repeat(500);
+        let mut assistant_msg = Message::assistant("Calling tools");
+        assistant_msg.tool_calls = Some(vec![
+            ToolCall::new("call_1", "web_fetch", "{}"),
+            ToolCall::new("call_2", "web_search", "{}"),
+            ToolCall::new("call_3", "shell", "{}"),
+            ToolCall::new("call_4", "read_file", "{}"),
+            ToolCall::new("call_5", "edit_file", "{}"),
+            ToolCall::new("call_6", "web_fetch", "{}"),
+        ]);
+        let msgs = vec![
+            assistant_msg,
+            Message::tool_result("call_1", &long_content), // pos=0, dist=5 → stale (>=3)
+            Message::tool_result("call_2", &long_content), // pos=1, dist=4 → stale (>=3)
+            Message::tool_result("call_3", &long_content), // pos=2, dist=3 → stale (>=3)
+            Message::tool_result("call_4", &long_content), // pos=3, dist=2 → mid-age
+            Message::tool_result("call_5", &long_content), // pos=4, dist=1 → mid-age
+            Message::tool_result("call_6", &long_content), // pos=5, dist=0 → recent
+        ];
+        // recent_count=1, stale_threshold=3
+        let result = shrink_tool_results_progressive(msgs, 200, 1, 3);
+
+        // Stale: collapsed to one-liner
+        assert_eq!(result[1].content, "[web_fetch: result consumed]");
+        assert_eq!(result[2].content, "[web_search: result consumed]");
+        assert_eq!(result[3].content, "[shell: result consumed]");
+
+        // Mid-age: shrunk with 1/4 budget (200/4=50)
+        assert!(result[4].content.contains("...[shrunk from"));
+        assert!(result[5].content.contains("...[shrunk from"));
+        let mid_base_len = result[4].content.find("\n...[shrunk").unwrap();
+        assert!(
+            mid_base_len <= 50,
+            "Mid-age base ({}) should be <= 50",
+            mid_base_len
+        );
+
+        // Recent: shrunk with full budget (200)
+        assert!(result[6].content.contains("...[shrunk from"));
+        let recent_base_len = result[6].content.find("\n...[shrunk").unwrap();
+        assert!(
+            recent_base_len > mid_base_len,
+            "Recent base ({}) should be > mid-age ({})",
+            recent_base_len,
+            mid_base_len
+        );
+    }
+
+    #[test]
+    fn test_stale_threshold_larger_than_total() {
+        let long_content = "x".repeat(500);
+        let msgs = vec![
+            Message::tool_result("call_1", &long_content),
+            Message::tool_result("call_2", &long_content),
+            Message::tool_result("call_3", &long_content),
+        ];
+        // stale_threshold=100 — no results should be stale
+        let result = shrink_tool_results_progressive(msgs, 200, 1, 100);
+
+        // All should be shrunk, none collapsed
+        assert!(result[0].content.contains("...[shrunk from"));
+        assert!(result[1].content.contains("...[shrunk from"));
+        assert!(result[2].content.contains("...[shrunk from"));
+        // None should contain "result consumed"
+        assert!(!result[0].content.contains("result consumed"));
+        assert!(!result[1].content.contains("result consumed"));
+        assert!(!result[2].content.contains("result consumed"));
     }
 
     // ── try_recover_context ──────────────────────────────────────────
